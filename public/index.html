@@ -65,6 +65,17 @@
     }
     .toggle.active .toggle-dot { background: var(--green); }
 
+    .header-right { display: flex; align-items: center; gap: 10px; }
+
+    .btn-shutdown {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 16px; border-radius: 20px; border: 1px solid transparent;
+      background: rgba(248, 113, 113, 0.12); color: var(--red);
+      font-size: 13px; font-weight: 500; cursor: pointer;
+      transition: all 0.2s; user-select: none;
+    }
+    .btn-shutdown:hover { border-color: var(--red); background: rgba(248, 113, 113, 0.22); }
+
     /* ── Main layout ── */
     .main { flex: 1; display: flex; overflow: hidden; }
 
@@ -207,9 +218,14 @@
       <div class="logo">&#8652; LAN Transfer</div>
       <div class="device-info" id="device-info"></div>
     </div>
-    <div class="toggle" id="toggle" onclick="api('toggle')">
-      <div class="toggle-dot"></div>
-      <span id="toggle-text">Hidden</span>
+    <div class="header-right">
+      <div class="toggle" id="toggle" onclick="api('toggle')">
+        <div class="toggle-dot"></div>
+        <span id="toggle-text">Hidden</span>
+      </div>
+      <button class="btn-shutdown" onclick="doShutdown()" title="Stop the server">
+        &#x23FB; Stop Server
+      </button>
     </div>
   </div>
 
@@ -301,6 +317,13 @@
 
   function respondTransfer(requestId, accepted) {
     api('respond', { requestId: requestId, accepted: accepted });
+  }
+
+  function doShutdown() {
+    if (confirm('Stop the server? This will close LAN Transfer.')) {
+      api('shutdown');
+      document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6b6b8d;font-size:18px;">Server stopped. You can close this tab.</div>';
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────

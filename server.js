@@ -56,6 +56,22 @@ function getLocalIP() {
   return '127.0.0.1';
 }
 
+/** Compute subnet broadcast address from local IP and netmask. */
+function getBroadcastAddresses() {
+  const addrs = [];
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const iface of ifaces) {
+      if (iface.family === 'IPv4' && !iface.internal && iface.netmask) {
+        const ipParts = iface.address.split('.').map(Number);
+        const maskParts = iface.netmask.split('.').map(Number);
+        const broadcast = ipParts.map((octet, i) => (octet | (~maskParts[i] & 255))).join('.');
+        addrs.push(broadcast);
+      }
+    }
+  }
+  return addrs.length > 0 ? addrs : ['255.255.255.255'];
+}
+
 function serializeState() {
   return JSON.stringify({
     isDiscoverable,
@@ -193,6 +209,13 @@ const server = http.createServer(async (req, res) => {
         pendingRequests.delete(data.requestId);
       }
     }
+    else if (req.url === '/api/shutdown') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+      console.log('\n  Server stopped by user.');
+      setTimeout(() => process.exit(0), 200);
+      return;
+    }
 
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
@@ -256,11 +279,13 @@ udp.on('error', err => {
 
 udp.bind(DISCOVERY_PORT);
 
-// Broadcaster — send beacon every 3 s
+// Broadcaster — send beacon every 3 s (to subnet broadcast addresses)
 setInterval(() => {
   if (!isDiscoverable) return;
   const msg = JSON.stringify({ device_name: deviceName, tcp_port: TRANSFER_PORT });
-  udp.send(msg, DISCOVERY_PORT, '255.255.255.255', () => {});
+  for (const addr of getBroadcastAddresses()) {
+    udp.send(msg, DISCOVERY_PORT, addr, () => {});
+  }
 }, BROADCAST_INTERVAL);
 
 // Prune stale peers
@@ -479,6 +504,53 @@ function formatSize(bytes) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Windows Firewall check
+// ──────────────────────────────────────────────────────────────────────────────
+function checkWindowsFirewall() {
+  if (process.platform !== 'win32') return;
+
+  const ruleName = 'LAN Transfer (lantransfer)';
+  const nodeExe = process.execPath;
+
+  // Check if a firewall rule already exists
+  exec(`netsh advfirewall firewall show rule name="${ruleName}"`, { windowsHide: true }, (err, stdout) => {
+    if (!err && stdout.includes(ruleName)) {
+      if (stdout.includes('Enabled:') && stdout.includes('Yes')) {
+        console.log('  Firewall:  Allowed');
+        return;
+      }
+    }
+
+    // No rule — prompt user via UAC elevation
+    console.log('');
+    console.log('  !! Firewall rule not found for LAN Transfer.');
+    console.log('  !! Device discovery requires UDP/TCP through Windows Firewall.');
+    console.log('  !! Requesting permission (UAC prompt)...');
+    console.log('');
+
+    const addCmd = [
+      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=UDP localport=${DISCOVERY_PORT} program="${nodeExe}" enable=yes`,
+      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=TCP localport=${TRANSFER_PORT} program="${nodeExe}" enable=yes`,
+    ].join(' & ');
+
+    const psCmd = `powershell -Command "Start-Process cmd -ArgumentList '/c ${addCmd.replace(/"/g, '\\"')}' -Verb RunAs -Wait"`;
+
+    exec(psCmd, { windowsHide: false, timeout: 60_000 }, (err2) => {
+      if (err2) {
+        console.log('  !! Firewall permission denied. Discovery will NOT work.');
+        console.log('  !! To fix manually:');
+        console.log('  !!   1. Open Windows Security > Firewall & network protection');
+        console.log('  !!   2. Click "Allow an app through firewall"');
+        console.log('  !!   3. Add Node.js and allow Private + Public networks');
+        console.log('');
+      } else {
+        console.log('  Firewall:  Rule added! Discovery should work now.');
+      }
+    });
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Start
 // ──────────────────────────────────────────────────────────────────────────────
 server.on('error', err => {
@@ -497,6 +569,9 @@ server.listen(HTTP_PORT, () => {
   console.log(`  Local IP:  ${ip}`);
   console.log(`  UI:        http://localhost:${HTTP_PORT}`);
   console.log('');
+
+  // Check firewall on Windows
+  checkWindowsFirewall();
 
   // Auto-open browser
   const url = `http://localhost:${HTTP_PORT}`;
