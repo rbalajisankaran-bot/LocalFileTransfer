@@ -165,6 +165,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Ping endpoint for HTTP-based discovery ──
+  if (req.method === 'GET' && req.url === '/api/ping') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify({
+      app: 'lantransfer',
+      device_name: deviceName,
+      tcp_port: TRANSFER_PORT,
+    }));
+    return;
+  }
+
   // ── SSE stream ──
   if (req.method === 'GET' && req.url === '/events') {
     res.writeHead(200, {
@@ -504,51 +518,82 @@ function formatSize(bytes) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Windows Firewall check
+// HTTP-based discovery (no firewall rules needed — outbound TCP only)
 // ──────────────────────────────────────────────────────────────────────────────
-function checkWindowsFirewall() {
-  if (process.platform !== 'win32') return;
-
-  const ruleName = 'LAN Transfer (lantransfer)';
-  const nodeExe = process.execPath;
-
-  // Check if a firewall rule already exists
-  exec(`netsh advfirewall firewall show rule name="${ruleName}"`, { windowsHide: true }, (err, stdout) => {
-    if (!err && stdout.includes(ruleName)) {
-      if (stdout.includes('Enabled:') && stdout.includes('Yes')) {
-        console.log('  Firewall:  Allowed');
-        return;
+function getSubnetIPs() {
+  const results = [];
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const iface of ifaces) {
+      if (iface.family === 'IPv4' && !iface.internal && iface.netmask) {
+        const ipParts = iface.address.split('.').map(Number);
+        const maskParts = iface.netmask.split('.').map(Number);
+        // Only scan /24 or smaller subnets to keep it fast
+        if (maskParts[2] === 255) {
+          const base = ipParts.slice(0, 3).join('.');
+          for (let i = 1; i < 255; i++) {
+            const ip = `${base}.${i}`;
+            if (ip !== iface.address) results.push(ip);
+          }
+        }
       }
     }
+  }
+  return results;
+}
 
-    // No rule — prompt user via UAC elevation
-    console.log('');
-    console.log('  !! Firewall rule not found for LAN Transfer.');
-    console.log('  !! Device discovery requires UDP/TCP through Windows Firewall.');
-    console.log('  !! Requesting permission (UAC prompt)...');
-    console.log('');
-
-    const addCmd = [
-      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=UDP localport=${DISCOVERY_PORT} program="${nodeExe}" enable=yes`,
-      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=TCP localport=${TRANSFER_PORT} program="${nodeExe}" enable=yes`,
-    ].join(' & ');
-
-    const psCmd = `powershell -Command "Start-Process cmd -ArgumentList '/c ${addCmd.replace(/"/g, '\\"')}' -Verb RunAs -Wait"`;
-
-    exec(psCmd, { windowsHide: false, timeout: 60_000 }, (err2) => {
-      if (err2) {
-        console.log('  !! Firewall permission denied. Discovery will NOT work.');
-        console.log('  !! To fix manually:');
-        console.log('  !!   1. Open Windows Security > Firewall & network protection');
-        console.log('  !!   2. Click "Allow an app through firewall"');
-        console.log('  !!   3. Add Node.js and allow Private + Public networks');
-        console.log('');
-      } else {
-        console.log('  Firewall:  Rule added! Discovery should work now.');
-      }
+function pingHost(ip) {
+  return new Promise(resolve => {
+    const req = http.get(`http://${ip}:${HTTP_PORT}/api/ping`, { timeout: 800 }, res => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const d = JSON.parse(body);
+          if (d.app === 'lantransfer' && d.device_name !== deviceName) {
+            resolve({ ip, device_name: d.device_name, tcp_port: d.tcp_port });
+          } else resolve(null);
+        } catch { resolve(null); }
+      });
     });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
   });
 }
+
+let httpScanning = false;
+async function httpDiscoveryScan() {
+  if (!isDiscoverable || httpScanning) return;
+  httpScanning = true;
+  try {
+    const ips = getSubnetIPs();
+    // Scan in batches of 50 to avoid fd exhaustion
+    for (let i = 0; i < ips.length; i += 50) {
+      const batch = ips.slice(i, i + 50);
+      const results = await Promise.all(batch.map(pingHost));
+      for (const r of results) {
+        if (!r) continue;
+        const id = `${r.ip}:${r.tcp_port}`;
+        const isNew = !peers.has(id);
+        peers.set(id, {
+          device_name: r.device_name,
+          ip: r.ip,
+          tcp_port: r.tcp_port,
+          last_seen: Date.now(),
+        });
+        if (isNew) {
+          console.log(`  Found: ${r.device_name} (${r.ip})`);
+          broadcast();
+        }
+      }
+    }
+  } catch { /* scan error, ignore */ }
+  httpScanning = false;
+}
+
+// Run HTTP discovery scan every 5 seconds
+setInterval(httpDiscoveryScan, 5_000);
+// Also run immediately on start (after a short delay for server to be ready)
+setTimeout(httpDiscoveryScan, 1_000);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Start
@@ -569,9 +614,6 @@ server.listen(HTTP_PORT, () => {
   console.log(`  Local IP:  ${ip}`);
   console.log(`  UI:        http://localhost:${HTTP_PORT}`);
   console.log('');
-
-  // Check firewall on Windows
-  checkWindowsFirewall();
 
   // Auto-open browser
   const url = `http://localhost:${HTTP_PORT}`;
