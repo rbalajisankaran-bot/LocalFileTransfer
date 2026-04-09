@@ -8,7 +8,8 @@
   },
   "files": [
     "server.js",
-    "public/"
+    "public/",
+    "bin/"
   ],
   "scripts": {
     "start": "node server.js"
