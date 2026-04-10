@@ -1,6 +1,6 @@
 {
   "name": "@balaji003/lantransfer",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "LAN File Transfer — peer-to-peer file sharing over local network. Zero dependencies.",
   "main": "server.js",
   "bin": {
