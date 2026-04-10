@@ -357,7 +357,7 @@
   </div>
 
   <!-- Connection status -->
-  <div class="conn-status" id="conn-status"></div>
+  <div class="conn-status"><span id="conn-status"></span> <span id="version-text"></span></div>
 
 <script>
   // ──────────────────────────────────────────────────────────────────────────
@@ -500,6 +500,7 @@
       nameLoaded = true;
     }
     document.getElementById('local-ip').textContent = state.localIP || '';
+    document.getElementById('version-text').textContent = state.currentVersion ? 'v' + state.currentVersion : '';
 
     // Update banner
     const banner = document.getElementById('update-banner');
