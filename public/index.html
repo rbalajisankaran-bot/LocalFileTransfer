@@ -47,7 +47,14 @@
     }
     .header-left { display: flex; align-items: center; gap: 16px; }
     .logo { font-size: 20px; font-weight: 700; color: #8cc8ff; }
-    .device-info { color: var(--text-dim); font-size: 13px; }
+    .device-info { color: var(--text-dim); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+    .device-name-edit {
+      background: transparent; border: 1px solid transparent; color: var(--text);
+      font-size: 13px; font-family: inherit; padding: 2px 6px; border-radius: 4px;
+      width: 160px; outline: none; transition: border-color 0.2s;
+    }
+    .device-name-edit:hover { border-color: var(--border); }
+    .device-name-edit:focus { border-color: var(--accent); background: var(--surface-hover); }
 
     .toggle {
       display: flex; align-items: center; gap: 8px;
@@ -135,6 +142,22 @@
     .file-info { color: var(--text-dim); font-size: 13px; }
     .file-info.has-file { color: var(--text); font-weight: 500; }
 
+    .file-list { margin-top: 12px; }
+    .file-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; background: var(--surface); border-radius: var(--radius);
+      margin-bottom: 4px; font-size: 13px;
+    }
+    .file-item-left { display: flex; align-items: center; gap: 8px; overflow: hidden; }
+    .file-item-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-item-size { color: var(--text-dim); white-space: nowrap; }
+    .file-item-radio { accent-color: var(--accent); cursor: pointer; }
+    .file-item-remove {
+      background: none; border: none; color: var(--text-dim); cursor: pointer;
+      font-size: 16px; padding: 0 4px; line-height: 1; transition: color 0.12s;
+    }
+    .file-item-remove:hover { color: var(--red); }
+
     /* ── Transfers ── */
     .transfers-section { flex: 1; overflow-y: auto; padding: 16px 24px; }
     .transfer {
@@ -216,7 +239,11 @@
   <div class="header">
     <div class="header-left">
       <div class="logo">&#8652; LAN Transfer</div>
-      <div class="device-info" id="device-info"></div>
+      <div class="device-info">
+        <input class="device-name-edit" id="device-name" type="text" maxlength="50" title="Click to edit device name" />
+        <span style="color:var(--text-dim)">&#183;</span>
+        <span id="local-ip"></span>
+      </div>
     </div>
     <div class="header-right">
       <div class="toggle" id="toggle" onclick="api('toggle')">
@@ -243,9 +270,10 @@
       <div class="send-panel">
         <div class="send-title">Send File</div>
         <div class="send-row">
-          <button class="btn btn-browse" onclick="api('browse')">Browse</button>
-          <span class="file-info" id="file-info">No file selected</span>
+          <button class="btn btn-browse" id="browse-btn" onclick="doBrowse()">Browse</button>
+          <span class="file-info" id="file-info">No files added</span>
         </div>
+        <div class="file-list" id="file-list"></div>
         <div class="send-row" style="margin-top: 12px;">
           <button class="btn btn-send" id="send-btn" onclick="doSend()" disabled>Send</button>
         </div>
@@ -273,6 +301,8 @@
   // ──────────────────────────────────────────────────────────────────────────
   let state = {};
   let selectedPeerId = null;
+  let selectedFileId = null;
+  let browsing = false;
 
   // ──────────────────────────────────────────────────────────────────────────
   // SSE connection
@@ -282,6 +312,10 @@
     evtSource = new EventSource('/events');
     evtSource.onmessage = e => {
       state = JSON.parse(e.data);
+      // Auto-select the latest file if none selected
+      if (!selectedFileId && state.sharedFiles && state.sharedFiles.length > 0) {
+        selectedFileId = state.sharedFiles[state.sharedFiles.length - 1].id;
+      }
       render();
     };
     evtSource.onopen = () => {
@@ -297,7 +331,7 @@
   // API
   // ──────────────────────────────────────────────────────────────────────────
   function api(endpoint, data) {
-    fetch('/api/' + endpoint, {
+    return fetch('/api/' + endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data || {}),
@@ -309,9 +343,28 @@
     render();
   }
 
+  function selectFile(id) {
+    selectedFileId = id;
+    render();
+  }
+
+  function removeFile(id) {
+    api('remove-file', { fileId: id });
+    if (selectedFileId === id) selectedFileId = null;
+  }
+
+  async function doBrowse() {
+    if (browsing) return;
+    browsing = true;
+    document.getElementById('browse-btn').textContent = 'Opening...';
+    await api('browse');
+    browsing = false;
+    document.getElementById('browse-btn').textContent = 'Browse';
+  }
+
   function doSend() {
-    if (selectedPeerId && state.selectedFile) {
-      api('send', { peerId: selectedPeerId });
+    if (selectedPeerId && selectedFileId) {
+      api('send', { peerId: selectedPeerId, fileId: selectedFileId });
     }
   }
 
@@ -327,12 +380,28 @@
   }
 
   // ──────────────────────────────────────────────────────────────────────────
+  // Device name editing
+  // ──────────────────────────────────────────────────────────────────────────
+  const nameInput = document.getElementById('device-name');
+  let nameLoaded = false;
+  nameInput.addEventListener('change', () => {
+    const val = nameInput.value.trim();
+    if (val) api('rename', { name: val });
+  });
+  nameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') nameInput.blur();
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
   // Render
   // ──────────────────────────────────────────────────────────────────────────
   function render() {
-    // Header
-    const info = document.getElementById('device-info');
-    info.textContent = (state.deviceName || '') + '  \u00B7  ' + (state.localIP || '');
+    // Device name (only set once to avoid clobbering user edits)
+    if (!nameLoaded && state.deviceName) {
+      nameInput.value = state.deviceName;
+      nameLoaded = true;
+    }
+    document.getElementById('local-ip').textContent = state.localIP || '';
 
     // Toggle
     const toggle = document.getElementById('toggle');
@@ -350,7 +419,6 @@
     if (!state.peers || state.peers.length === 0) {
       peersEl.innerHTML = '<div class="empty-msg">Searching for nearby devices&hellip;<br><br><small>Make sure both devices are on the same WiFi</small></div>';
     } else {
-      // Validate selection still exists
       if (selectedPeerId && !state.peers.some(p => p.id === selectedPeerId)) {
         selectedPeerId = null;
       }
@@ -362,26 +430,47 @@
       ).join('');
     }
 
-    // File info
+    // Shared files
+    const files = state.sharedFiles || [];
     const fileInfoEl = document.getElementById('file-info');
-    if (state.selectedFile) {
-      fileInfoEl.className = 'file-info has-file';
-      fileInfoEl.textContent = state.selectedFile.name + '  \u00B7  ' + formatSize(state.selectedFile.size);
-    } else {
+    const fileListEl = document.getElementById('file-list');
+
+    if (files.length === 0) {
       fileInfoEl.className = 'file-info';
-      fileInfoEl.textContent = 'No file selected';
+      fileInfoEl.textContent = 'No files added';
+      fileListEl.innerHTML = '';
+      selectedFileId = null;
+    } else {
+      fileInfoEl.className = 'file-info has-file';
+      fileInfoEl.textContent = files.length + ' file' + (files.length > 1 ? 's' : '') + ' ready to send';
+      // Validate selection
+      if (selectedFileId && !files.some(f => f.id === selectedFileId)) {
+        selectedFileId = files[files.length - 1].id;
+      }
+      fileListEl.innerHTML = files.map(f =>
+        '<div class="file-item">'
+        + '<div class="file-item-left">'
+        + '<input type="radio" name="sel-file" class="file-item-radio" '
+        + (selectedFileId === f.id ? 'checked ' : '')
+        + 'onchange="selectFile(\'' + esc(f.id) + '\')" />'
+        + '<span class="file-item-name">' + esc(f.name) + '</span>'
+        + '<span class="file-item-size">' + formatSize(f.size) + '</span>'
+        + '</div>'
+        + '<button class="file-item-remove" onclick="removeFile(\'' + esc(f.id) + '\')" title="Remove">&times;</button>'
+        + '</div>'
+      ).join('');
     }
 
     // Send button
     const sendBtn = document.getElementById('send-btn');
-    const canSend = !!(selectedPeerId && state.selectedFile && state.peers && state.peers.some(p => p.id === selectedPeerId));
+    const canSend = !!(selectedPeerId && selectedFileId && state.peers && state.peers.some(p => p.id === selectedPeerId));
     sendBtn.disabled = !canSend;
     if (canSend) {
       const peer = state.peers.find(p => p.id === selectedPeerId);
       sendBtn.textContent = 'Send to ' + (peer ? peer.name : 'peer');
-    } else if (selectedPeerId && !state.selectedFile) {
+    } else if (selectedPeerId && !selectedFileId) {
       sendBtn.textContent = 'Select a file first';
-    } else if (!selectedPeerId && state.selectedFile) {
+    } else if (!selectedPeerId && selectedFileId) {
       sendBtn.textContent = 'Select a device first';
     } else {
       sendBtn.textContent = 'Send';

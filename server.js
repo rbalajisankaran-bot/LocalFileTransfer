@@ -32,15 +32,38 @@ const PEER_TIMEOUT = 10_000;   // ms
 const BROADCAST_INTERVAL = 3_000; // ms
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Persistent config (device name)
+// ──────────────────────────────────────────────────────────────────────────────
+const CONFIG_PATH = path.join(os.homedir(), '.lantransfer.json');
+
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+  } catch { return {}; }
+}
+
+function saveConfig(cfg) {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    console.log(`  [config] Saved to ${CONFIG_PATH}`);
+  } catch (e) {
+    console.error(`  [config] Failed to save: ${e.message}`);
+  }
+}
+
+const config = loadConfig();
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Application state
 // ──────────────────────────────────────────────────────────────────────────────
 let isDiscoverable = true;
-const deviceName = os.hostname();
-let selectedFile = null;              // { path, name, size }
+let deviceName = config.deviceName || os.hostname();
+const sharedFiles = [];               // [ { id, path, name, size } ]
 const peers = new Map();              // id → { device_name, ip, tcp_port, last_seen }
 const transfers = [];                 // [ TransferEntry ]
 const pendingRequests = new Map();    // id → { filename, size, senderName, resolve }
 let idCounter = 0;
+let browseInProgress = false;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // SSE (Server-Sent Events) clients
@@ -80,9 +103,8 @@ function serializeState() {
     peers: [...peers.entries()].map(([id, p]) => ({
       id, name: p.device_name, ip: p.ip,
     })),
-    selectedFile: selectedFile
-      ? { name: selectedFile.name, size: selectedFile.size }
-      : null,
+    sharedFiles: sharedFiles.map(f => ({ id: f.id, name: f.name, size: f.size })),
+    selectedFileId: sharedFiles.length > 0 ? sharedFiles[sharedFiles.length - 1].id : null,
     transfers: transfers.map(t => ({
       id: t.id, filename: t.filename, size: t.size,
       direction: t.direction, peerName: t.peerName,
@@ -167,6 +189,11 @@ const server = http.createServer(async (req, res) => {
 
   // ── Ping endpoint for HTTP-based discovery ──
   if (req.method === 'GET' && req.url === '/api/ping') {
+    if (!isDiscoverable) {
+      res.writeHead(403);
+      res.end('Hidden');
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -200,20 +227,54 @@ const server = http.createServer(async (req, res) => {
 
     if (req.url === '/api/toggle') {
       isDiscoverable = !isDiscoverable;
+      console.log(`  [toggle] Discoverable: ${isDiscoverable}`);
     }
     else if (req.url === '/api/browse') {
-      const fp = await openFileDialog();
-      if (fp) {
-        try {
-          const s = fs.statSync(fp);
-          selectedFile = { path: fp, name: path.basename(fp), size: s.size };
-        } catch { selectedFile = null; }
+      if (browseInProgress) {
+        console.log('  [browse] Dialog already open, ignoring');
+      } else {
+        browseInProgress = true;
+        console.log('  [browse] Opening file dialog...');
+        const fp = await openFileDialog();
+        browseInProgress = false;
+        if (fp) {
+          try {
+            const s = fs.statSync(fp);
+            const file = { id: String(idCounter++), path: fp, name: path.basename(fp), size: s.size };
+            sharedFiles.push(file);
+            console.log(`  [browse] Added: ${file.name} (${formatSize(file.size)})`);
+          } catch (e) {
+            console.error(`  [browse] Error reading file: ${e.message}`);
+          }
+        } else {
+          console.log('  [browse] Cancelled');
+        }
+      }
+    }
+    else if (req.url === '/api/remove-file') {
+      const idx = sharedFiles.findIndex(f => f.id === data.fileId);
+      if (idx !== -1) {
+        console.log(`  [files] Removed: ${sharedFiles[idx].name}`);
+        sharedFiles.splice(idx, 1);
       }
     }
     else if (req.url === '/api/send') {
       const peer = peers.get(data.peerId);
-      if (peer && selectedFile) {
-        sendFile(peer, { ...selectedFile });
+      const file = sharedFiles.find(f => f.id === data.fileId);
+      if (peer && file) {
+        console.log(`  [send] ${file.name} -> ${peer.device_name} (${peer.ip})`);
+        sendFile(peer, { ...file });
+      } else {
+        console.log(`  [send] Failed — peer: ${!!peer}, file: ${!!file}`);
+      }
+    }
+    else if (req.url === '/api/rename') {
+      const newName = (data.name || '').trim();
+      if (newName && newName.length <= 50) {
+        deviceName = newName;
+        config.deviceName = newName;
+        saveConfig(config);
+        console.log(`  [rename] Device name set to: ${deviceName}`);
       }
     }
     else if (req.url === '/api/respond') {
@@ -221,6 +282,7 @@ const server = http.createServer(async (req, res) => {
       if (pending) {
         pending.resolve(!!data.accepted);
         pendingRequests.delete(data.requestId);
+        console.log(`  [respond] ${data.accepted ? 'Accepted' : 'Rejected'} transfer ${data.requestId}`);
       }
     }
     else if (req.url === '/api/shutdown') {
@@ -267,7 +329,6 @@ const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
 udp.on('listening', () => {
   udp.setBroadcast(true);
-  console.log(`  Discovery  UDP :${DISCOVERY_PORT}`);
 });
 
 udp.on('message', (msg, rinfo) => {
@@ -325,9 +386,7 @@ tcpServer.on('error', err => {
   console.error('  Is another instance running? (port conflict on TCP ' + TRANSFER_PORT + ')');
 });
 
-tcpServer.listen(TRANSFER_PORT, () => {
-  console.log(`  Transfer   TCP :${TRANSFER_PORT}`);
-});
+tcpServer.listen(TRANSFER_PORT);
 
 async function handleIncoming(socket) {
   // Read header length (8 bytes, little-endian u64)
@@ -612,6 +671,9 @@ server.listen(HTTP_PORT, () => {
   console.log('  ⇄  LAN File Transfer');
   console.log(`  Device:    ${deviceName}`);
   console.log(`  Local IP:  ${ip}`);
+  console.log(`  Discovery  HTTP scan (no firewall needed)`);
+  console.log(`  Discovery  UDP :${DISCOVERY_PORT} (fallback)`);
+  console.log(`  Transfer   TCP :${TRANSFER_PORT}`);
   console.log(`  UI:        http://localhost:${HTTP_PORT}`);
   console.log('');
 

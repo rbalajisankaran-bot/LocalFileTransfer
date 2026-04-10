@@ -9,7 +9,8 @@
   "files": [
     "server.js",
     "public/",
-    "bin/"
+    "bin/",
+    "README.md"
   ],
   "scripts": {
     "start": "node server.js"
