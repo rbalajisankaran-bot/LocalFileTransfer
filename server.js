@@ -58,6 +58,7 @@ const config = loadConfig();
 // ──────────────────────────────────────────────────────────────────────────────
 let isDiscoverable = true;
 let deviceName = config.deviceName || os.hostname();
+let downloadDir = config.downloadDir || path.join(os.homedir(), 'Downloads');
 const sharedFiles = [];               // [ { id, path, name, size } ]
 const peers = new Map();              // id → { device_name, ip, tcp_port, last_seen }
 const transfers = [];                 // [ TransferEntry ]
@@ -99,6 +100,7 @@ function serializeState() {
   return JSON.stringify({
     isDiscoverable,
     deviceName,
+    downloadDir,
     localIP: getLocalIP(),
     peers: [...peers.entries()].map(([id, p]) => ({
       id, name: p.device_name, ip: p.ip,
@@ -110,6 +112,7 @@ function serializeState() {
       direction: t.direction, peerName: t.peerName,
       status: t.status, progress: t.progress,
       speed: t.speed, error: t.error,
+      savePath: t.savePath || null,
     })),
     incomingRequests: [...pendingRequests.entries()].map(([id, r]) => ({
       id, filename: r.filename, size: r.size, senderName: r.senderName,
@@ -277,12 +280,32 @@ const server = http.createServer(async (req, res) => {
         console.log(`  [rename] Device name set to: ${deviceName}`);
       }
     }
+    else if (req.url === '/api/set-download-dir') {
+      // Open native folder picker
+      const dir = await openFolderDialog();
+      if (dir) {
+        downloadDir = dir;
+        config.downloadDir = dir;
+        saveConfig(config);
+        console.log(`  [config] Download dir set to: ${downloadDir}`);
+      }
+    }
     else if (req.url === '/api/respond') {
       const pending = pendingRequests.get(data.requestId);
       if (pending) {
         pending.resolve(!!data.accepted);
         pendingRequests.delete(data.requestId);
         console.log(`  [respond] ${data.accepted ? 'Accepted' : 'Rejected'} transfer ${data.requestId}`);
+      }
+    }
+    else if (req.url === '/api/open-folder') {
+      const filePath = data.path;
+      if (filePath && fs.existsSync(filePath)) {
+        const dir = path.dirname(filePath);
+        if (process.platform === 'win32') exec(`explorer /select,"${filePath}"`);
+        else if (process.platform === 'darwin') exec(`open -R "${filePath}"`);
+        else exec(`xdg-open "${dir}"`);
+        console.log(`  [open] ${filePath}`);
       }
     }
     else if (req.url === '/api/shutdown') {
@@ -315,6 +338,22 @@ function openFileDialog() {
       cmd = 'osascript -e \'POSIX path of (choose file with prompt "Select file to send")\'';
     } else {
       cmd = 'zenity --file-selection --title="Select file to send" 2>/dev/null || kdialog --getopenfilename . 2>/dev/null';
+    }
+    exec(cmd, { encoding: 'utf-8', windowsHide: true, timeout: 120_000 }, (err, stdout) => {
+      resolve(err ? null : (stdout.trim() || null));
+    });
+  });
+}
+
+function openFolderDialog() {
+  return new Promise(resolve => {
+    let cmd;
+    if (process.platform === 'win32') {
+      cmd = 'powershell -sta -command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = \'Select download folder\'; if($f.ShowDialog() -eq \'OK\'){Write-Output $f.SelectedPath}"';
+    } else if (process.platform === 'darwin') {
+      cmd = 'osascript -e \'POSIX path of (choose folder with prompt "Select download folder")\'';
+    } else {
+      cmd = 'zenity --file-selection --directory --title="Select download folder" 2>/dev/null || kdialog --getexistingdirectory . 2>/dev/null';
     }
     exec(cmd, { encoding: 'utf-8', windowsHide: true, timeout: 120_000 }, (err, stdout) => {
       resolve(err ? null : (stdout.trim() || null));
@@ -430,8 +469,8 @@ async function handleIncoming(socket) {
   transfers.push(t);
   broadcast();
 
-  // Unique save path in Downloads
-  const dl = path.join(os.homedir(), 'Downloads');
+  // Unique save path in download directory
+  const dl = downloadDir;
   if (!fs.existsSync(dl)) fs.mkdirSync(dl, { recursive: true });
   let savePath = path.join(dl, filename);
   let counter = 1;
@@ -440,6 +479,8 @@ async function handleIncoming(socket) {
   while (fs.existsSync(savePath)) {
     savePath = path.join(dl, `${base} (${counter++})${ext}`);
   }
+
+  t.savePath = savePath;
 
   const ws = fs.createWriteStream(savePath);
   let received = 0;
