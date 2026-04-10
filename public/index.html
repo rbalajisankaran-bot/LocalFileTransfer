@@ -586,11 +586,13 @@
       extra += '</div>';
     }
 
+    const encrypted = (t.status === 'in_progress' || t.status === 'completed') ? ' \uD83D\uDD12' : '';
+
     return '<div class="transfer">'
       + '<div class="transfer-top">'
       + '<div class="transfer-info">'
       + '<span class="transfer-icon">' + icon + '</span>'
-      + '<span>' + esc(t.filename) + ' ' + arrow + ' ' + esc(peer) + '</span>'
+      + '<span>' + esc(t.filename) + ' ' + arrow + ' ' + esc(peer) + encrypted + '</span>'
       + '</div>'
       + '<span class="badge ' + badgeClass + '">' + badgeText + '</span>'
       + '</div>'

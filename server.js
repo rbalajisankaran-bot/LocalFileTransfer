@@ -4,10 +4,9 @@
  * server.js — LAN File Transfer (Node.js rewrite)
  *
  * Zero external dependencies. Uses built-in modules only.
- * Protocol-compatible with the original Rust version:
- *   - UDP discovery on port 34254
+ *   - HTTP + UDP discovery
  *   - TCP file transfer on port 34255
- *   - XOR obfuscation with key "LAN-XFER-KEY-2024"
+ *   - E2E encryption: ECDH key exchange + AES-256-CTR
  *
  * Run:  node server.js
  * Then open http://localhost:3000 in a browser.
@@ -16,6 +15,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const dgram = require('dgram');
 const net = require('net');
 const os = require('os');
@@ -27,9 +27,9 @@ const { exec } = require('child_process');
 const DISCOVERY_PORT = 34254;
 const TRANSFER_PORT = 34255;
 const HTTP_PORT = 3000;
-const XOR_KEY = Buffer.from('LAN-XFER-KEY-2024');
 const PEER_TIMEOUT = 10_000;   // ms
 const BROADCAST_INTERVAL = 3_000; // ms
+const ECDH_CURVE = 'prime256v1'; // NIST P-256
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Persistent config (device name)
@@ -128,14 +128,18 @@ function broadcast() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Helpers — E2E encryption (ECDH + AES-256-CTR)
 // ──────────────────────────────────────────────────────────────────────────────
-function xorCrypt(buf, offset) {
-  const out = Buffer.allocUnsafe(buf.length);
-  for (let i = 0; i < buf.length; i++) {
-    out[i] = buf[i] ^ XOR_KEY[(offset + i) % XOR_KEY.length];
-  }
-  return out;
+function createKeyPair() {
+  const ecdh = crypto.createECDH(ECDH_CURVE);
+  ecdh.generateKeys();
+  return ecdh;
+}
+
+function deriveKey(ecdh, peerPubKey) {
+  const shared = ecdh.computeSecret(peerPubKey);
+  // SHA-256 the shared secret to get a 32-byte AES key
+  return crypto.createHash('sha256').update(shared).digest();
 }
 
 function readBody(req) {
@@ -536,12 +540,32 @@ async function handleIncoming(socket) {
   t.savePath = savePath;
   console.log(`  [recv] Saving to: ${savePath}`);
 
+  // ── E2E key exchange: receive sender's public key, send ours ──
+  const pubKeyLenBuf = await readExact(socket, 2);
+  const pubKeyLen = pubKeyLenBuf.readUInt16BE(0);
+  const senderPubKey = await readExact(socket, pubKeyLen);
+  console.log(`  [recv] Got sender public key (${pubKeyLen} bytes)`);
+
+  const ecdh = createKeyPair();
+  const myPubKey = ecdh.getPublicKey();
+  const keyLenBuf = Buffer.alloc(2);
+  keyLenBuf.writeUInt16BE(myPubKey.length);
+  socket.write(keyLenBuf);
+  socket.write(myPubKey);
+  console.log(`  [recv] Sent our public key (${myPubKey.length} bytes)`);
+
+  // Derive AES key + receive IV
+  const aesKey = deriveKey(ecdh, senderPubKey);
+  const iv = await readExact(socket, 16);
+  console.log(`  [recv] AES key derived, IV received — decrypting with AES-256-CTR`);
+
+  const decipher = crypto.createDecipheriv('aes-256-ctr', aesKey, iv);
   const ws = fs.createWriteStream(savePath);
   let received = 0;
   let lastBc = 0;
 
   socket.on('data', chunk => {
-    const decrypted = xorCrypt(chunk, received);
+    const decrypted = decipher.update(chunk);
     ws.write(decrypted);
     received += chunk.length;
 
@@ -558,6 +582,8 @@ async function handleIncoming(socket) {
 
   await new Promise((resolve, reject) => {
     socket.on('end', () => {
+      const final = decipher.final();
+      if (final.length > 0) ws.write(final);
       ws.end();
       t.status = 'completed';
       t.progress = 100;
@@ -595,6 +621,7 @@ async function sendFile(peer, file) {
       socket.connect(peer.tcp_port, peer.ip, res);
       socket.once('error', rej);
     });
+    console.log(`  [send] Connected to ${peer.ip}:${peer.tcp_port}`);
 
     // Send header
     const headerJSON = JSON.stringify({
@@ -613,20 +640,44 @@ async function sendFile(peer, file) {
       t.error = 'Rejected by recipient';
       broadcast();
       socket.end();
+      console.log(`  [send] Rejected by ${peer.device_name}`);
       return;
     }
+
+    console.log(`  [send] Accepted — starting E2E key exchange`);
+
+    // ── E2E key exchange: send our public key, receive receiver's ──
+    const ecdh = createKeyPair();
+    const myPubKey = ecdh.getPublicKey();
+    const keyLenBuf = Buffer.alloc(2);
+    keyLenBuf.writeUInt16BE(myPubKey.length);
+    socket.write(keyLenBuf);
+    socket.write(myPubKey);
+    console.log(`  [send] Sent our public key (${myPubKey.length} bytes)`);
+
+    const recvKeyLenBuf = await readExact(socket, 2);
+    const recvKeyLen = recvKeyLenBuf.readUInt16BE(0);
+    const recvPubKey = await readExact(socket, recvKeyLen);
+    console.log(`  [send] Got receiver public key (${recvKeyLen} bytes)`);
+
+    // Derive AES key, generate IV, send IV
+    const aesKey = deriveKey(ecdh, recvPubKey);
+    const iv = crypto.randomBytes(16);
+    socket.write(iv);
+    console.log(`  [send] AES key derived, IV sent — encrypting with AES-256-CTR`);
 
     t.status = 'in_progress';
     t._start = Date.now();
     broadcast();
 
-    // Stream file with XOR encryption
+    // Stream file with AES-256-CTR encryption
+    const cipher = crypto.createCipheriv('aes-256-ctr', aesKey, iv);
     const rs = fs.createReadStream(file.path, { highWaterMark: 65536 });
     let sent = 0;
     let lastBc = 0;
 
     for await (const chunk of rs) {
-      const encrypted = xorCrypt(Buffer.from(chunk), sent);
+      const encrypted = cipher.update(Buffer.from(chunk));
       const ok = socket.write(encrypted);
       sent += chunk.length;
 
@@ -649,16 +700,20 @@ async function sendFile(peer, file) {
       }
     }
 
+    // Write final cipher block
+    const final = cipher.final();
+    if (final.length > 0) socket.write(final);
+
     socket.end();
     t.status = 'completed';
     t.progress = 100;
     broadcast();
-    console.log(`  Sent: ${file.name} → ${peer.device_name}`);
+    console.log(`  [send] Complete: ${file.name} → ${peer.device_name}`);
   } catch (e) {
     t.status = 'failed';
     t.error = e.message;
     broadcast();
-    console.error(`  Send error: ${e.message}`);
+    console.error(`  [send] Error: ${e.message}`);
   }
 }
 
@@ -770,6 +825,7 @@ server.listen(HTTP_PORT, () => {
   console.log(`  Discovery  HTTP scan (no firewall needed)`);
   console.log(`  Discovery  UDP :${DISCOVERY_PORT} (fallback)`);
   console.log(`  Transfer   TCP :${TRANSFER_PORT}`);
+  console.log(`  Encryption ECDH + AES-256-CTR (E2E)`);
   console.log(`  UI:        http://localhost:${HTTP_PORT}`);
   console.log('');
 
