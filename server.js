@@ -13,6 +13,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -30,6 +31,10 @@ const HTTP_PORT = 3000;
 const PEER_TIMEOUT = 10_000;   // ms
 const BROADCAST_INTERVAL = 3_000; // ms
 const ECDH_CURVE = 'prime256v1'; // NIST P-256
+const PKG = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+const CURRENT_VERSION = PKG.version;
+const PKG_NAME = PKG.name;
+let latestVersion = null; // filled by update check
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Persistent config (device name)
@@ -101,6 +106,8 @@ function serializeState() {
     isDiscoverable,
     deviceName,
     downloadDir,
+    currentVersion: CURRENT_VERSION,
+    latestVersion,
     localIP: getLocalIP(),
     peers: [...peers.entries()].map(([id, p]) => ({
       id, name: p.device_name, ip: p.ip,
@@ -353,6 +360,34 @@ const server = http.createServer(async (req, res) => {
       } else {
         console.log(`  [open] Failed — transferId: ${transferId}, found: ${!!t}, savePath: ${t ? t.savePath : 'N/A'}`);
       }
+    }
+    else if (req.url === '/api/check-update') {
+      checkForUpdate();
+    }
+    else if (req.url === '/api/do-update') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+      console.log(`  [update] Running: npm install -g ${PKG_NAME}`);
+      exec(`npm install -g ${PKG_NAME}`, { timeout: 120_000 }, (err, stdout, stderr) => {
+        if (err) {
+          console.error(`  [update] Failed: ${err.message}`);
+          console.error(stderr);
+        } else {
+          console.log(`  [update] Success! Restarting...`);
+          console.log(stdout);
+          // Restart the process
+          setTimeout(() => {
+            const args = process.argv.slice(1);
+            const child = require('child_process').spawn(process.execPath, args, {
+              detached: true,
+              stdio: 'ignore',
+            });
+            child.unref();
+            process.exit(0);
+          }, 500);
+        }
+      });
+      return;
     }
     else if (req.url === '/api/shutdown') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -718,6 +753,33 @@ async function sendFile(peer, file) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Update checker
+// ──────────────────────────────────────────────────────────────────────────────
+function checkForUpdate() {
+  const url = `https://registry.npmjs.org/${PKG_NAME}/latest`;
+  console.log(`  [update] Checking ${url}`);
+  https.get(url, { timeout: 5000 }, res => {
+    let body = '';
+    res.on('data', c => body += c);
+    res.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        latestVersion = data.version || null;
+        console.log(`  [update] Current: ${CURRENT_VERSION}, Latest: ${latestVersion}`);
+        if (latestVersion && latestVersion !== CURRENT_VERSION) {
+          console.log(`  [update] Update available! Run: npm install -g ${PKG_NAME}`);
+        }
+        broadcast();
+      } catch (e) {
+        console.error(`  [update] Parse error: ${e.message}`);
+      }
+    });
+  }).on('error', e => {
+    console.error(`  [update] Check failed: ${e.message}`);
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Utility
 // ──────────────────────────────────────────────────────────────────────────────
 function formatSize(bytes) {
@@ -826,8 +888,12 @@ server.listen(HTTP_PORT, () => {
   console.log(`  Discovery  UDP :${DISCOVERY_PORT} (fallback)`);
   console.log(`  Transfer   TCP :${TRANSFER_PORT}`);
   console.log(`  Encryption ECDH + AES-256-CTR (E2E)`);
+  console.log(`  Version    ${CURRENT_VERSION}`);
   console.log(`  UI:        http://localhost:${HTTP_PORT}`);
   console.log('');
+
+  // Check for updates on startup
+  checkForUpdate();
 
   // Auto-open browser
   const url = `http://localhost:${HTTP_PORT}`;

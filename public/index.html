@@ -186,6 +186,28 @@
     }
     .btn-change-dir:hover { background: var(--surface-hover); border-color: var(--accent); }
 
+    /* ── Update banner ── */
+    .update-banner {
+      display: none; align-items: center; justify-content: center; gap: 12px;
+      padding: 8px 24px; background: rgba(74, 158, 255, 0.1);
+      border-bottom: 1px solid var(--accent); font-size: 13px; flex-shrink: 0;
+    }
+    .update-banner.show { display: flex; }
+    .update-banner span { color: var(--text); }
+    .update-banner .version-new { color: var(--green); font-weight: 600; }
+    .update-banner .version-old { color: var(--text-dim); }
+    .btn-update {
+      background: var(--accent); color: #fff; border: none; border-radius: 4px;
+      padding: 3px 12px; font-size: 12px; font-weight: 500; cursor: pointer;
+      transition: background 0.12s;
+    }
+    .btn-update:hover { background: var(--accent-dim); }
+    .btn-dismiss {
+      background: none; border: none; color: var(--text-dim); cursor: pointer;
+      font-size: 16px; padding: 0 4px; line-height: 1;
+    }
+    .btn-dismiss:hover { color: var(--text); }
+
     /* ── Transfers ── */
     .transfers-section { flex: 1; overflow-y: auto; padding: 16px 24px; }
     .transfer {
@@ -282,6 +304,13 @@
         &#x23FB; Stop Server
       </button>
     </div>
+  </div>
+
+  <!-- Update banner -->
+  <div class="update-banner" id="update-banner">
+    <span>Update available: <span class="version-old" id="ver-current"></span> → <span class="version-new" id="ver-latest"></span></span>
+    <button class="btn-update" id="update-btn" onclick="doUpdate()">Update Now</button>
+    <button class="btn-dismiss" onclick="dismissUpdate()" title="Dismiss">&times;</button>
   </div>
 
   <!-- Download location -->
@@ -419,6 +448,28 @@
     api('open-folder', { transferId: transferId });
   }
 
+  let updateDismissed = false;
+
+  function doUpdate() {
+    const btn = document.getElementById('update-btn');
+    btn.textContent = 'Updating...';
+    btn.disabled = true;
+    api('do-update');
+    // Server will restart — poll until it's back
+    setTimeout(function poll() {
+      fetch('/api/ping').then(() => {
+        window.location.reload();
+      }).catch(() => {
+        setTimeout(poll, 1000);
+      });
+    }, 3000);
+  }
+
+  function dismissUpdate() {
+    updateDismissed = true;
+    document.getElementById('update-banner').classList.remove('show');
+  }
+
   function doShutdown() {
     if (confirm('Stop the server? This will close LAN Transfer.')) {
       api('shutdown');
@@ -449,6 +500,16 @@
       nameLoaded = true;
     }
     document.getElementById('local-ip').textContent = state.localIP || '';
+
+    // Update banner
+    const banner = document.getElementById('update-banner');
+    if (!updateDismissed && state.latestVersion && state.currentVersion && state.latestVersion !== state.currentVersion) {
+      document.getElementById('ver-current').textContent = 'v' + state.currentVersion;
+      document.getElementById('ver-latest').textContent = 'v' + state.latestVersion;
+      banner.classList.add('show');
+    } else {
+      banner.classList.remove('show');
+    }
 
     // Download dir
     const dirEl = document.getElementById('download-dir');
