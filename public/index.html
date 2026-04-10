@@ -347,6 +347,8 @@
     evtSource = new EventSource('/events');
     evtSource.onmessage = e => {
       state = JSON.parse(e.data);
+      console.log('[sse] State update — peers:', state.peers?.length, 'files:', state.sharedFiles?.length,
+        'transfers:', state.transfers?.length, 'incoming:', !!state.incomingRequest);
       // Auto-select the latest file if none selected
       if (!selectedFileId && state.sharedFiles && state.sharedFiles.length > 0) {
         selectedFileId = state.sharedFiles[state.sharedFiles.length - 1].id;
@@ -354,9 +356,11 @@
       render();
     };
     evtSource.onopen = () => {
+      console.log('[sse] Connected');
       document.getElementById('conn-status').textContent = '';
     };
-    evtSource.onerror = () => {
+    evtSource.onerror = (e) => {
+      console.error('[sse] Error/disconnected', e);
       document.getElementById('conn-status').textContent = 'Reconnecting...';
     };
   }
@@ -366,10 +370,16 @@
   // API
   // ──────────────────────────────────────────────────────────────────────────
   function api(endpoint, data) {
+    console.log('[api]', endpoint, data || '');
     return fetch('/api/' + endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data || {}),
+    }).then(r => {
+      console.log('[api]', endpoint, 'response:', r.status);
+      return r;
+    }).catch(err => {
+      console.error('[api]', endpoint, 'error:', err);
     });
   }
 
@@ -388,13 +398,9 @@
     if (selectedFileId === id) selectedFileId = null;
   }
 
-  async function doBrowse() {
-    if (browsing) return;
-    browsing = true;
-    document.getElementById('browse-btn').textContent = 'Opening...';
-    await api('browse');
-    browsing = false;
-    document.getElementById('browse-btn').textContent = 'Browse';
+  function doBrowse() {
+    console.log('[browse] Clicked');
+    api('browse');
   }
 
   function doSend() {
@@ -403,12 +409,14 @@
     }
   }
 
-  function respondTransfer(requestId, accepted) {
-    api('respond', { requestId: requestId, accepted: accepted });
+  function respondTransfer(accepted) {
+    console.log('[respondTransfer] accepted:', accepted);
+    api('respond', { accepted: accepted });
   }
 
-  function openFolder(filePath) {
-    api('open-folder', { path: filePath });
+  function openFolder(transferId) {
+    console.log('[openFolder] transferId:', transferId);
+    api('open-folder', { transferId: transferId });
   }
 
   function doShutdown() {
@@ -531,8 +539,8 @@
     // Modal
     const overlay = document.getElementById('modal-overlay');
     const modal = document.getElementById('modal');
-    if (state.incomingRequests && state.incomingRequests.length > 0) {
-      const req = state.incomingRequests[0];
+    if (state.incomingRequest) {
+      const req = state.incomingRequest;
       overlay.classList.add('show');
       modal.innerHTML =
         '<div class="modal-title">Incoming File</div>'
@@ -540,8 +548,8 @@
         + '<div class="modal-file">' + esc(req.filename) + '</div>'
         + '<div class="modal-size">' + formatSize(req.size) + '</div>'
         + '<div class="modal-buttons">'
-        + '<button class="btn-accept" onclick="respondTransfer(\'' + esc(req.id) + '\', true)">Accept</button>'
-        + '<button class="btn-reject" onclick="respondTransfer(\'' + esc(req.id) + '\', false)">Reject</button>'
+        + '<button class="btn-accept" onclick="respondTransfer(true)">Accept</button>'
+        + '<button class="btn-reject" onclick="respondTransfer(false)">Reject</button>'
         + '</div>';
     } else {
       overlay.classList.remove('show');
@@ -573,7 +581,7 @@
       extra = '<div class="transfer-actions">'
         + '<span class="transfer-size">' + formatSize(t.size) + '</span>';
       if (t.status === 'completed' && t.direction === 'receive' && t.savePath) {
-        extra += '<button class="btn-open-folder" onclick="openFolder(\'' + esc(t.savePath.replace(/\\/g, '\\\\')) + '\')">Open Folder</button>';
+        extra += '<button class="btn-open-folder" onclick="openFolder(\'' + esc(t.id) + '\')">Open Folder</button>';
       }
       extra += '</div>';
     }

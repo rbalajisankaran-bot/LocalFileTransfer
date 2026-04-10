@@ -62,7 +62,7 @@ let downloadDir = config.downloadDir || path.join(os.homedir(), 'Downloads');
 const sharedFiles = [];               // [ { id, path, name, size } ]
 const peers = new Map();              // id → { device_name, ip, tcp_port, last_seen }
 const transfers = [];                 // [ TransferEntry ]
-const pendingRequests = new Map();    // id → { filename, size, senderName, resolve }
+let pendingRequest = null;            // { filename, size, senderName, resolve } or null
 let idCounter = 0;
 let browseInProgress = false;
 
@@ -114,9 +114,9 @@ function serializeState() {
       speed: t.speed, error: t.error,
       savePath: t.savePath || null,
     })),
-    incomingRequests: [...pendingRequests.entries()].map(([id, r]) => ({
-      id, filename: r.filename, size: r.size, senderName: r.senderName,
-    })),
+    incomingRequest: pendingRequest
+      ? { filename: pendingRequest.filename, size: pendingRequest.size, senderName: pendingRequest.senderName }
+      : null,
   });
 }
 
@@ -180,6 +180,8 @@ function readExact(socket, n) {
 const htmlPath = path.join(__dirname, 'public', 'index.html');
 
 const server = http.createServer(async (req, res) => {
+  console.log(`  [http] ${req.method} ${req.url}`);
+
   // ── Serve the web UI ──
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
     fs.readFile(htmlPath, (err, data) => {
@@ -217,7 +219,11 @@ const server = http.createServer(async (req, res) => {
       'Connection': 'keep-alive',
     });
     sseClients.add(res);
-    req.on('close', () => sseClients.delete(res));
+    console.log(`  [sse] Client connected (total: ${sseClients.size})`);
+    req.on('close', () => {
+      sseClients.delete(res);
+      console.log(`  [sse] Client disconnected (total: ${sseClients.size})`);
+    });
     res.write(`data: ${serializeState()}\n\n`);
     return;
   }
@@ -233,32 +239,40 @@ const server = http.createServer(async (req, res) => {
       console.log(`  [toggle] Discoverable: ${isDiscoverable}`);
     }
     else if (req.url === '/api/browse') {
+      // Respond immediately so we don't block the HTTP connection
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
       if (browseInProgress) {
         console.log('  [browse] Dialog already open, ignoring');
       } else {
         browseInProgress = true;
         console.log('  [browse] Opening file dialog...');
-        const fp = await openFileDialog();
-        browseInProgress = false;
-        if (fp) {
-          try {
+        try {
+          const fp = await openFileDialog();
+          browseInProgress = false;
+          if (fp) {
             const s = fs.statSync(fp);
             const file = { id: String(idCounter++), path: fp, name: path.basename(fp), size: s.size };
             sharedFiles.push(file);
             console.log(`  [browse] Added: ${file.name} (${formatSize(file.size)})`);
-          } catch (e) {
-            console.error(`  [browse] Error reading file: ${e.message}`);
+          } else {
+            console.log('  [browse] Cancelled by user');
           }
-        } else {
-          console.log('  [browse] Cancelled');
+        } catch (e) {
+          browseInProgress = false;
+          console.error(`  [browse] Error: ${e.message}`);
         }
+        broadcast();
       }
+      return; // already responded
     }
     else if (req.url === '/api/remove-file') {
       const idx = sharedFiles.findIndex(f => f.id === data.fileId);
       if (idx !== -1) {
         console.log(`  [files] Removed: ${sharedFiles[idx].name}`);
         sharedFiles.splice(idx, 1);
+      } else {
+        console.log(`  [files] Remove failed — fileId not found: ${data.fileId}`);
       }
     }
     else if (req.url === '/api/send') {
@@ -266,9 +280,9 @@ const server = http.createServer(async (req, res) => {
       const file = sharedFiles.find(f => f.id === data.fileId);
       if (peer && file) {
         console.log(`  [send] ${file.name} -> ${peer.device_name} (${peer.ip})`);
-        sendFile(peer, { ...file });
+        sendFile(peer, { ...file }).catch(e => console.error(`  [send] Unhandled: ${e.message}`));
       } else {
-        console.log(`  [send] Failed — peer: ${!!peer}, file: ${!!file}`);
+        console.log(`  [send] Failed — peer: ${!!peer} (${data.peerId}), file: ${!!file} (${data.fileId})`);
       }
     }
     else if (req.url === '/api/rename') {
@@ -278,34 +292,62 @@ const server = http.createServer(async (req, res) => {
         config.deviceName = newName;
         saveConfig(config);
         console.log(`  [rename] Device name set to: ${deviceName}`);
+      } else {
+        console.log(`  [rename] Invalid name: "${data.name}"`);
       }
     }
     else if (req.url === '/api/set-download-dir') {
-      // Open native folder picker
-      const dir = await openFolderDialog();
-      if (dir) {
-        downloadDir = dir;
-        config.downloadDir = dir;
-        saveConfig(config);
-        console.log(`  [config] Download dir set to: ${downloadDir}`);
+      // Respond immediately so we don't block the HTTP connection
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+      console.log('  [config] Opening folder dialog...');
+      try {
+        const dir = await openFolderDialog();
+        if (dir) {
+          downloadDir = dir;
+          config.downloadDir = dir;
+          saveConfig(config);
+          console.log(`  [config] Download dir set to: ${downloadDir}`);
+        } else {
+          console.log('  [config] Folder dialog cancelled');
+        }
+      } catch (e) {
+        console.error(`  [config] Folder dialog error: ${e.message}`);
       }
+      broadcast();
+      return; // already responded
     }
     else if (req.url === '/api/respond') {
-      const pending = pendingRequests.get(data.requestId);
-      if (pending) {
-        pending.resolve(!!data.accepted);
-        pendingRequests.delete(data.requestId);
-        console.log(`  [respond] ${data.accepted ? 'Accepted' : 'Rejected'} transfer ${data.requestId}`);
+      console.log(`  [respond] Received: accepted=${data.accepted}`);
+      if (pendingRequest) {
+        pendingRequest.resolve(!!data.accepted);
+        console.log(`  [respond] ${data.accepted ? 'Accepted' : 'Rejected'}: ${pendingRequest.filename}`);
+        pendingRequest = null;
+      } else {
+        console.log(`  [respond] WARNING: No pending request`);
       }
     }
     else if (req.url === '/api/open-folder') {
-      const filePath = data.path;
-      if (filePath && fs.existsSync(filePath)) {
-        const dir = path.dirname(filePath);
-        if (process.platform === 'win32') exec(`explorer /select,"${filePath}"`);
-        else if (process.platform === 'darwin') exec(`open -R "${filePath}"`);
-        else exec(`xdg-open "${dir}"`);
-        console.log(`  [open] ${filePath}`);
+      const transferId = data.transferId;
+      const t = transfers.find(tr => tr.id === transferId);
+      if (t && t.savePath) {
+        console.log(`  [open] Opening folder for: ${t.savePath}`);
+        if (fs.existsSync(t.savePath)) {
+          if (process.platform === 'win32') exec(`explorer /select,"${t.savePath}"`);
+          else if (process.platform === 'darwin') exec(`open -R "${t.savePath}"`);
+          else exec(`xdg-open "${path.dirname(t.savePath)}"`);
+        } else {
+          console.log(`  [open] File no longer exists: ${t.savePath}`);
+          // Open the directory instead
+          const dir = path.dirname(t.savePath);
+          if (fs.existsSync(dir)) {
+            if (process.platform === 'win32') exec(`explorer "${dir}"`);
+            else if (process.platform === 'darwin') exec(`open "${dir}"`);
+            else exec(`xdg-open "${dir}"`);
+          }
+        }
+      } else {
+        console.log(`  [open] Failed — transferId: ${transferId}, found: ${!!t}, savePath: ${t ? t.savePath : 'N/A'}`);
       }
     }
     else if (req.url === '/api/shutdown') {
@@ -314,6 +356,9 @@ const server = http.createServer(async (req, res) => {
       console.log('\n  Server stopped by user.');
       setTimeout(() => process.exit(0), 200);
       return;
+    }
+    else {
+      console.log(`  [http] Unknown POST endpoint: ${req.url}`);
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -428,32 +473,40 @@ tcpServer.on('error', err => {
 tcpServer.listen(TRANSFER_PORT);
 
 async function handleIncoming(socket) {
+  const remoteAddr = `${socket.remoteAddress}:${socket.remotePort}`;
+  console.log(`  [recv] TCP connection from ${remoteAddr}`);
+
   // Read header length (8 bytes, little-endian u64)
   const lenBuf = await readExact(socket, 8);
   const headerLen = Number(lenBuf.readBigUInt64LE(0));
+  console.log(`  [recv] Header length: ${headerLen} bytes`);
 
   // Read header JSON
   const headerBuf = await readExact(socket, headerLen);
   const header = JSON.parse(headerBuf.toString('utf-8'));
   const { filename, size, sender_name } = header;
 
-  console.log(`  Incoming: ${filename} (${formatSize(size)}) from ${sender_name}`);
+  console.log(`  [recv] Incoming: "${filename}" (${formatSize(size)}) from ${sender_name}`);
 
   // Prompt user for accept / reject
-  const reqId = String(idCounter++);
+  console.log(`  [recv] Waiting for user decision...`);
+
   const accepted = await new Promise(resolve => {
-    pendingRequests.set(reqId, { filename, size, senderName: sender_name, resolve });
+    pendingRequest = { filename, size, senderName: sender_name, resolve };
     broadcast();
 
     // Auto-reject if sender disconnects while waiting
     socket.once('close', () => {
-      if (pendingRequests.has(reqId)) {
-        pendingRequests.delete(reqId);
+      if (pendingRequest && pendingRequest.resolve === resolve) {
+        console.log(`  [recv] Sender disconnected while waiting, auto-rejecting`);
+        pendingRequest = null;
         resolve(false);
         broadcast();
       }
     });
   });
+
+  console.log(`  [recv] User decision: ${accepted ? 'ACCEPTED' : 'REJECTED'}`);
 
   // Send decision byte
   socket.write(Buffer.from([accepted ? 1 : 0]));
@@ -481,6 +534,7 @@ async function handleIncoming(socket) {
   }
 
   t.savePath = savePath;
+  console.log(`  [recv] Saving to: ${savePath}`);
 
   const ws = fs.createWriteStream(savePath);
   let received = 0;
@@ -508,7 +562,7 @@ async function handleIncoming(socket) {
       t.status = 'completed';
       t.progress = 100;
       broadcast();
-      console.log(`  Saved: ${savePath}`);
+      console.log(`  [recv] Complete: ${savePath} (${formatSize(received)})`);
       resolve();
     });
     socket.on('error', err => {
@@ -516,6 +570,7 @@ async function handleIncoming(socket) {
       t.status = 'failed';
       t.error = err.message;
       broadcast();
+      console.error(`  [recv] Socket error: ${err.message}`);
       reject(err);
     });
   });
